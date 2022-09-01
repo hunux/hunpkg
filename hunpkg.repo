@@ -1,0 +1,10 @@
+#
+# /etc/hunpkg.repo : hunpkg repo file
+#
+# format:
+#    <repo directory> <repo url for sync>
+#
+# example:
+#    /usr/ports/core     https://raw.githubusercontent.com/emmett1/ports/master/core
+#    /usr/ports/localports
+#

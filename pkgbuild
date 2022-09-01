@@ -1,0 +1,628 @@
+#!/bin/sh
+#
+#  hunpkg
+#
+#  Copyright (c) 2018 by Emmett1  (emmett1.2miligrams@gmail.com)
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+
+msg() {
+	echo "==> $1"
+}
+
+msg2() {
+	echo " -> $1"
+}
+
+msgerr() {
+	echo "==> ERROR: $1" >&2
+}
+
+msgwarn() {
+	echo "==> WARNING: $1" >&2
+}
+
+pkg_genchecksums() {
+	for i in $(get_filepath); do
+		[ -f "$i" ] || {
+			msgerr "File missing: $i"
+			err=1
+		}
+	done
+	[ "$err" = 1 ] && abort 1
+	generatemdsum > .checksums
+	msg "Checksums updated."
+}
+
+generatemdsum() {
+	for s in $(get_filepath); do
+		if [ -f $s ]; then
+			needupdatechecksum="$needupdatechecksum $s"
+		fi
+	done
+	if [ "$needupdatechecksum" ]; then
+		md5sum $needupdatechecksum | sed -e 's|  .*/|  |' | sort -k 2
+	else
+		echo SKIP
+	fi
+}
+
+pkg_checksum() {
+	TMPCHECKSUM=$WORK_DIR/checksumstmp.$$
+	ORICHECKSUM=$WORK_DIR/checksumsori.$$
+	DIFCHECKSUM=$WORK_DIR/checksumsdiff.$$
+	
+	if [ ! -f .checksums ]; then
+		pkg_genchecksums
+	else
+		if [ "$IGNORE_MDSUM" != "yes" ] && [ "$IGNORE_MDSUM" != 1 ]; then
+			msg "Checking checksums..."
+			generatemdsum > "$TMPCHECKSUM"
+			sort -k2 .checksums > "$ORICHECKSUM"
+			diff -w -t -U 0 "$ORICHECKSUM" "$TMPCHECKSUM" > "$DIFCHECKSUM"
+		fi
+	fi
+	
+	[ -s "$DIFCHECKSUM" ] && {
+		mismatch=1
+		cat "$DIFCHECKSUM" \
+		| sed '/---/d' \
+		| sed '/+++/d' \
+		| sed '/@@/d' \
+		| sed 's/^-/ -> missing: /' \
+		| sed 's/^+/ -> new    : /'
+	}
+	
+	rm -f "$TMPCHECKSUM" "$DIFCHECKSUM" "$ORICHECKSUM"
+	
+	[ "$mismatch" = 1 ] && abort 1
+}
+
+get_filepath() {
+	for i in $source; do
+		case $i in
+			*::*) echo $SOURCE_DIR/${i%::*};;
+			*://*) echo $SOURCE_DIR/${i##*/};;
+			*) echo $PWD/$i;;
+		esac
+	done
+}
+
+pkg_fetch() {
+	for i in $source; do
+		case $i in
+			*::*)  filepath="$SOURCE_DIR/${i%::*}"; url=${i#*::};;
+			*://*) filepath="$SOURCE_DIR/${i##*/}"; url=$i;;
+			*) continue;;
+		esac
+		[ -f "$filepath" ] && {
+			msg "Source found: $filepath"
+			continue
+		}
+		[ -f "$filepath.partial" ] && COPT="-C -"
+		msg "Fetching: $i"
+		curl $COPT -L --fail --ftp-pasv --retry 3 --retry-delay 3 -o $filepath.partial $CURL_OPTS $url || {
+			msgerr "Fetching failed: $i"
+			abort 1
+		}
+		mv $filepath.partial $filepath
+	done
+}
+
+pkg_unpack() {
+	SRC=$WORK_DIR/$name/src
+	PKG=$WORK_DIR/$name/pkg
+	
+	umask 022
+	
+	rm -fr $WORK_DIR/$name
+	
+	mkdir -p $SRC $PKG
+	
+	TAR=tar
+	[ $(command -v bsdtar) ] && TAR=bsdtar
+	
+	for i in $(get_filepath); do
+		if [ ! -f "$i" ]; then
+			msgerr "Source missing: $i"
+			abort 1
+		fi
+		for n in $noextract; do
+			if [ ${i##*/} = $n ]; then
+				msg "Preparing: $i"
+				cp $i $SRC || {
+					msgerr "Preparing failed: $i"
+					abort 1
+				}
+				continue 2
+			fi
+		done
+		case $i in
+			*.tar|*.tar.gz|*.tar.Z|*.tgz|*.tar.bz2|*.tar.lz|*.tbz2|*.tar.xz|*.txz|*.tar.lzma|*.zip|*.rpm)
+				msg "Unpacking: $i"
+				$TAR -p -o -C $SRC -xf $i;;
+			*)
+				msg "Preparing: $i"
+				cp $i $SRC;;
+		esac
+		[ $? = 0 ] || {
+			msgerr "Unpacking/Preparing failed: $i"
+			abort 1
+		}
+	done	
+}
+
+pkg_build() {	
+	[ "$(id -u)" = 0 ] || {
+		msgerr "You must build package as root, or use fakeroot."
+		abort 1
+	}
+	
+	msg "Build start: $name-$version-$release"
+	
+	cd $SRC >/dev/null
+	if [ "$QUIET" ]; then
+		(set -e -x; build) 2> /dev/null
+	else
+		(set -e -x; build 2>&1)
+	fi
+		
+	if [ $? != 0 ]; then
+		msgerr "Build failed: $name-$version-$release"
+		abort 1
+	else
+		msg "Build success: $name-$version-$release"
+	fi
+	
+	cd - >/dev/null
+}
+
+pkglint() {
+	linterror=0
+	
+	# cant package empty PKG
+	if [ ! "$(find $PKG/* -maxdepth 1 -type d 2>/dev/null)" ]; then
+		msgerr "PKG is empty"
+		abort 1
+	fi
+	
+	# check for backup file
+	for f in $backup; do
+		if [ ! -f $PKG/$f ]; then
+			msgerr "Backup file '$f' does not exist in PKG!"
+			linterror=1
+		fi
+	done
+	
+	if [ "$linterror" = 1 ]; then
+		abort 1
+	fi
+}
+
+strip_files() {	
+	if [ "$nostrip" ]; then
+		for i in $nostrip; do
+			xstrip="$xstrip -e $i"
+		done
+		FILTER="grep -v $xstrip"
+	else
+		FILTER="cat"
+	fi
+			
+	find . -type f -printf "%P\n" 2>/dev/null | $FILTER | while read -r binary ; do
+		case "$(file -bi "$binary")" in
+			*application/x-sharedlib*)  # Libraries (.so)
+				${CROSS_COMPILE}strip --strip-unneeded "$binary" 2>/dev/null ;;
+			*application/x-pie-executable*)  # Libraries (.so)
+				${CROSS_COMPILE}strip --strip-unneeded "$binary" 2>/dev/null ;;
+			*application/x-archive*)    # Libraries (.a)
+				${CROSS_COMPILE}strip --strip-debug "$binary" 2>/dev/null ;;
+			*application/x-object*)
+				case "$binary" in
+					*.ko)                   # Kernel module
+						${CROSS_COMPILE}strip --strip-unneeded "$binary" 2>/dev/null ;;
+					*)
+						continue;;
+				esac;;
+			*application/x-executable*) # Binaries
+				${CROSS_COMPILE}strip --strip-all "$binary" 2>/dev/null ;;
+			*)
+				continue ;;
+		esac
+	done
+}
+
+compressinfomanpages() {
+	find . -type f -path "*/share/man/*" | while read -r file; do
+		if [ "$file" = "${file%%.gz}" ]; then
+			gzip -9 -f "$file"
+		fi
+	done
+	find . -type l -path "*/share/man/*" | while read -r file; do
+		FILE="${file%%.gz}.gz"
+		TARGET="$(readlink $file)"
+		TARGET="${TARGET##*/}"
+		TARGET="${TARGET%%.gz}.gz"
+		DIR=$(dirname "$FILE")
+		rm -f $file
+		if [ -e "$DIR/$TARGET" ]; then
+			ln -sf $TARGET $FILE
+		fi
+	done
+	find . -type f -path "*/share/info/*" | while read -r file; do
+		if [ "$file" = "${file%%.gz}" ]; then
+			gzip -9 -f "$file"
+		fi
+	done
+}
+
+pkg_package() {
+	# lint $PKG before packaging
+	pkglint
+	
+	cd $PKG >/dev/null
+	
+	# remove possible conflict junks
+	rm -f usr/share/info/dir usr/info/dir
+	rm -f usr/lib/charset.alias # on musl system
+	find . \( -name perllocal.pod -o -name .packlist \) -delete
+	[ -d usr/share/fonts ] && {
+		find usr/share/fonts \( -name fonts.dir -o -name fonts.scale \) -delete
+	}
+	
+	if [ "$KEEP_LIBTOOL" = 0 ] || [ "$KEEP_LIBTOOL" = "no" ]; then
+		find . ! -type d -name "*.la" -delete
+	fi
+	
+	if [ "$KEEP_LOCALE" = 0 ] || [ "$KEEP_LOCALE" = "no" ]; then
+		rm -fr usr/share/locale usr/locale usr/lib/locale
+	fi
+	
+	if [ "$KEEP_DOC" = 0 ] || [ "$KEEP_DOC" = "no" ]; then
+		rm -fr usr/share/doc usr/share/gtk-doc usr/doc usr/gtk-doc
+	fi
+	
+	if [ "$NO_STRIP" = 0 ] || [ "$NO_STRIP" = "no" ]; then
+		strip_files
+	fi
+	
+	compressinfomanpages
+	
+	if [ "$backup" ]; then
+		for FILE in $backup; do
+			mv $FILE $FILE.hpkgnew
+		done
+	fi
+	
+	[ "$FORCE_REBUILD" ] && rm -f "$PACKAGE_DIR/$PKGNAME"
+	
+	case $COMPRESSION_MODE in
+		xz) COMPRESS="-J" ;;
+		gz) COMPRESS="-z" ;;
+		bz2) COMPRESS="-j" ;;
+		lz4) COMPRESS="--lz4" ;;
+		zstd) COMPRESS="--zstd" ;;
+	esac
+	
+	tar -c $COMPRESS -f $PACKAGE_DIR/$PKGNAME * $addtotar || {
+		rm -f $PACKAGE_DIR/$PKGNAME
+		msgerr "Packaging failed: $PKGNAME"
+		abort 1
+	}
+	
+	tar -tvf $PACKAGE_DIR/$PKGNAME | sort -k 6
+	
+	msg "Packaging success: $PKGNAME ($(ls -lh $PACKAGE_DIR/$PKGNAME | awk '{print $5}'))"
+		
+	cd - >/dev/null
+	
+	if [ ! -f .pkgfiles ] || [ "$(head -n1 .pkgfiles)" != "$name-$version-$release" ]; then
+		pkg_genpkgfiles
+	fi
+}
+
+pkg_genpkgfiles() {
+	[ -f "$PACKAGE_DIR/$PKGNAME" ] || {
+		msgerr "Package not found: $PKGNAME"
+		exit 1
+	}
+	
+	echo "$name-$version-$release" > .pkgfiles
+	
+	tar -tvf "$PACKAGE_DIR/$PKGNAME" \
+	| awk '{$3=$4=$5=""; print $0}' \
+	| sort -k 3 >> .pkgfiles
+	msg "Pkgfiles updated."
+}
+
+pkg_clean() {
+	[ -e "$PACKAGE_DIR/$PKGNAME" ] && {
+		rm -f "$PACKAGE_DIR/$PKGNAME"
+		msg "Package removed: $PACKAGE_DIR/$PKGNAME"
+	}
+	for i in $(get_filepath); do
+		case $i in
+			$PWD/*) continue;;
+		esac
+		[ -e "$i" ] && {
+			rm -f "$i"
+			msg "File removed: $i"
+		}
+		[ -e "$i.partial" ] && {
+			rm -f "$i.partial"
+			msg "File removed: $i.partial"
+		}
+	done
+}
+
+check_buildscript() {	
+	# check the required field in buildscript
+	[ "$name" ] || { msgerr "'name' is empty!"; exit 1;	}
+	case $name in
+		*[A-Z]*) msgerr "Capital letters for port name are not allowed!"; exit 1;;
+	esac
+	[ "$(basename $(pwd))" = "$name" ] || { msgerr "Port name and Directory name is different!"; exit 1; }
+	[ "$version" ] || { msgerr "'version' is empty!"; exit 1; }
+	[ "$release" ] || { msgerr "'release' is empty!"; exit 1; }
+	[ "$(command -v build)" ] || { msgerr "'build' function not exist!"; exit 1; }
+	[ "$(echo "$version" | grep '-')" ] && { msgerr "'version' should not contain '-'."; exit 1; }
+	[ "$(echo "$release" | grep '-')" ] && { msgerr "'release' should not contain '-'."; exit 1; }
+	[ "$description" ] || { msgerr "'description' is empty!"; exit 1; }
+}
+
+checkdir() {
+	for DIR in "$@"; do
+		if [ ! -d $DIR ]; then
+			msgerr "Directory '$DIR' does not exist."
+			exit 1
+		elif [ ! -w $DIR ]; then
+			msgerr "Directory '$DIR' not writable."
+			exit 1
+		elif [ ! -x $DIR ] || [ ! -r $1 ]; then
+			msgerr "Directory '$DIR' not readable."
+			exit 1
+		fi
+	done
+}
+
+pkg_cleanup() {
+	if [ ! "$KEEP_WORK" ]; then
+		if [ "$name" ]; then
+			rm -fr "$WORK_DIR/$name"
+		fi
+	fi
+}
+
+interrupted() {
+	echo
+	abort 100
+}
+
+abort() {
+	rm -f "$LOCK_FILE"
+	pkg_cleanup
+	exit $1
+}
+
+parse_opts() {	
+	while [ "$1" ]; do
+		case $1 in
+		-q |	         --quiet) QUIET=yes ;;
+		-i |           --install) INSTALL_PKG=yes ;;
+		-u |           --upgrade) UPGRADE_PKG=yes; OPTS="$OPTS $1" ;;
+		-r |         --reinstall) REINSTALL_PKG=yes; OPTS="$OPTS $1" ;;
+		-c |   --ignore-conflict) OPTS="$OPTS $1" ;;
+		-v |           --verbose) OPTS="$OPTS $1" ;;
+		-f |     --force-rebuild) FORCE_REBUILD=yes ;;
+		-m |        --skip-mdsum) IGNORE_MDSUM=yes ;;
+		-g |          --genmdsum) UPDATE_MDSUM=yes ;;
+		-o |          --download) DOWNLOAD_ONLY=yes ;;
+		-x |           --extract) EXTRACT_ONLY=yes ;;
+		-w |         --keep-work) KEEP_WORK=yes ;;
+		-p |          --pkgfiles) GENPKGFILES=yes ;;
+		-h |              --help) SHOWHELP=yes ;;
+		                 --clean) CLEANUP=yes ;;
+		             --no-backup) OPTS="$OPTS $1" ;;
+		                --root=*) OPTS="$OPTS $1" ;;
+		              --config=*) PKGBUILD_CONF="${1#*=}" ;;
+		              --srcdir=*) CUSTOM_SOURCE_DIR="${1#*=}" ;;
+		              --pkgdir=*) CUSTOM_PACKAGE_DIR="${1#*=}" ;;
+		             --workdir=*) CUSTOM_WORK_DIR="${1#*=}" ;;
+		                       *) msg "Invalid $(basename $0) option! ($1)"; exit 1 ;;
+		esac
+		shift
+	done	
+}
+
+help() {	
+	cat << EOF
+Usage:
+  $(basename $0) [ <options> <arguments> ]
+
+Options:
+  -q  --quiet               show only status messages and errors
+  -i, --install             install package into system
+  -u, --upgrade             upgrade package
+  -r, --reinstall           reinstall package
+  -c, --ignore-conflict     ignore conflict when installing package
+  -v, --verbose             verbose install process
+  -f, --force-rebuild       rebuild package
+  -m, --skip-mdsum          skip md5sum checking
+  -g, --genmdsum            generate md5sum
+  -o, --download            download only source file
+  -x, --extract             extract only source file
+  -p, --pkgfiles            generate list files in package
+  -w, --keep-work           keep working directory
+  -h, --help                show this help message
+      --clean               remove downloaded sources and prebuilt packages
+      --config=<config>     use custom config file
+      --srcdir=<path>       override directory path for sources
+      --pkgdir=<path>       override directory path for compiled package
+      --workdir=<path>      override directory path for working dir
+      --no-backup           skip backup configuration file when upgrading package
+      
+EOF
+}
+
+extract_opts() {
+	while [ "$1" ]; do
+		case $1 in
+			--*) opts="$opts $1";;
+			-*) char=${#1}; count=1
+			    while [ "$count" != "$char" ]; do
+					count=$((count+1))
+					opts="$opts -$(echo $1 | cut -c $count)"
+				done;;
+			*) opts="$opts $1"
+		esac
+		shift
+	done
+	echo $opts
+}
+
+main() {
+	parse_opts $(extract_opts "$@")
+	
+	if [ -f "$PKGBUILD_CONF" ]; then
+		. "$PKGBUILD_CONF"
+	else
+		msgerr "Config file not found: $PKGBUILD_CONF"
+		exit 1
+	fi
+	
+	[ "$CUSTOM_SOURCE_DIR" ]  && SOURCE_DIR="$CUSTOM_SOURCE_DIR"	
+	[ "$CUSTOM_PACKAGE_DIR" ] && PACKAGE_DIR="$CUSTOM_PACKAGE_DIR"	
+	[ "$CUSTOM_WORK_DIR" ]    && WORK_DIR="$CUSTOM_WORK_DIR"
+	
+	checkdir "$SOURCE_DIR" "$PACKAGE_DIR" "$WORK_DIR"
+	
+	# show usage
+	[ "$SHOWHELP" ] && {
+		help
+		exit 0
+	}
+	
+	if [ -f "$PKGBUILD_BSCRIPT" ]; then
+		description=$(grep "^# description[[:blank:]]*:" $PKGBUILD_BSCRIPT | sed 's/^# description[[:blank:]]*:[[:blank:]]*//')
+		. ./$PKGBUILD_BSCRIPT
+	else
+		msgerr "'$PKGBUILD_BSCRIPT' file not found."
+		exit 1
+	fi
+	
+	check_buildscript
+
+	case $COMPRESSION_MODE in
+		gz|bz2|xz|lz4|zstd) PKGNAME="$name-$version-$release.hpkg.tar.$COMPRESSION_MODE" ;;
+		        *) msgerr "Invalid compression mode: $COMPRESSION_MODE"; exit 1 ;;
+	esac
+	
+	# generate .pkgfiles
+	[ "$GENPKGFILES" ] && {
+		pkg_genpkgfiles
+		exit 0
+	}
+	
+	# download source only
+	[ "$DOWNLOAD_ONLY" ] && {
+		pkg_fetch
+		exit 0
+	}
+	
+	# extract source only
+	[ "$EXTRACT_ONLY" ] && {
+		pkg_unpack
+		exit 0
+	}
+	
+	# update md5sum
+	[ "$UPDATE_MDSUM" ] && {
+		pkg_genchecksums
+		exit 0
+	}
+	
+	# remove source and package
+	[ "$CLEANUP" ] && {
+		pkg_clean
+		exit 0
+	}
+
+	LOCK_FILE="/tmp/pkgbuild.$name.lock"
+	
+	# check for lock file
+	[ -f "$LOCK_FILE" ] && {
+		msgerr "Cannot build same package simultaneously."
+		msgerr "remove '$LOCK_FILE' if no build process for '$name'."
+		exit 1
+	}
+	
+	# create lock file
+	touch "$LOCK_FILE" 2>/dev/null || {
+		msgerr "Cannot create lock file in '$LOCK_FILE'."
+		exit 1
+	}
+	
+	# build package
+	if [ -f "$PACKAGE_DIR/$PKGNAME" ] && [ ! "$FORCE_REBUILD" ]; then
+		if [ ! "$INSTALL_PKG" ] && [ ! "$REINSTALL_PKG" ] && [ ! "$UPGRADE_PKG" ]; then
+			msg "Package is up-to-date: $PKGNAME"
+			abort 0
+		fi
+	else
+		if [ "$QUIET" ]; then
+			msg "Building: $name-$version-$release"
+			pkg_fetch 2> /dev/null
+			pkg_checksum > /dev/null
+			pkg_unpack > /dev/null
+			pkg_build > /dev/null
+			pkg_package > /dev/null
+			pkg_cleanup > /dev/null
+		else
+			msg "Building: $name-$version-$release"
+			pkg_fetch
+			pkg_checksum
+			pkg_unpack
+			pkg_build 
+			pkg_package
+			pkg_cleanup
+		fi
+	fi
+	
+	# install package
+	if [ "$INSTALL_PKG" ] || [ "$REINSTALL_PKG" ] || [ "$UPGRADE_PKG" ]; then
+		pkgadd $PACKAGE_DIR/$PKGNAME $INST_OPT $OPTS || abort 1
+	fi
+	
+	abort 0	
+}
+
+trap "interrupted" 1 2 3 15
+
+export LC_ALL=C
+
+PKGBUILD_CONF="/etc/hunpkg.conf"
+PKGBUILD_BSCRIPT="hpkgbuild"
+
+SOURCE_DIR="/var/cache/hunpkg/sources"
+PACKAGE_DIR="/var/cache/hunpkg/packages"
+WORK_DIR="/var/cache/hunpkg/work"
+COMPRESSION_MODE="xz"
+NO_STRIP="no"
+IGNORE_MDSUM="no"
+KEEP_LIBTOOL="no"
+KEEP_LOCALE="no"
+KEEP_DOC="no"
+
+main "$@"
